@@ -1,14 +1,17 @@
 import tkinter as tk
-from tkinter import filedialog, scrolledtext, messagebox
+from tkinter import filedialog, scrolledtext, messagebox, ttk
 import shutil
 import os
 import sys
+import json
 from pathlib import Path
 from collections import defaultdict
 import threading
 
 # --- CONFIGURATION ---
 IGNORE_FILENAME = "SmartReplacer_IgnoreDirs.txt"
+SETTINGS_FILENAME = "settings.json"
+MAX_HISTORY = 10
 
 SYSTEM_JUNK = {
     'Thumbs.db', 'ehthumbs.db', 'Desktop.ini', 
@@ -73,29 +76,44 @@ class ConflictDialog:
 class FileReplacerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("SmartReplacer Tool")
-        self.root.geometry("700x550")
+        self.root.title("SmartReplacer Tool (History & Ignore Support)")
+        self.root.geometry("700x600")
+
+        # Load settings immediately
+        self.settings = self.load_settings()
 
         # --- UI Layout ---
         
-        # Source Directory
+        # Source Directory (Combobox)
         tk.Label(root, text="Source Directory (Files to copy):").pack(pady=(10, 0), anchor="w", padx=10)
         self.src_frame = tk.Frame(root)
         self.src_frame.pack(fill="x", padx=10, pady=5)
-        self.src_entry = tk.Entry(self.src_frame)
-        self.src_entry.pack(side="left", fill="x", expand=True)
+        
+        # Changed to Combobox for history
+        self.src_combo = ttk.Combobox(self.src_frame, values=self.settings['src_history'])
+        self.src_combo.pack(side="left", fill="x", expand=True)
+        # Pre-select last used if available
+        if self.settings['src_history']:
+            self.src_combo.current(0)
+            
         tk.Button(self.src_frame, text="Browse...", command=self.select_source).pack(side="right", padx=(5, 0))
 
-        # Target Directory
+        # Target Directory (Combobox)
         tk.Label(root, text="Target Directory (Search & Replace):").pack(pady=(10, 0), anchor="w", padx=10)
         self.dest_frame = tk.Frame(root)
         self.dest_frame.pack(fill="x", padx=10, pady=5)
-        self.dest_entry = tk.Entry(self.dest_frame)
-        self.dest_entry.pack(side="left", fill="x", expand=True)
+        
+        # Changed to Combobox for history
+        self.dest_combo = ttk.Combobox(self.dest_frame, values=self.settings['dest_history'])
+        self.dest_combo.pack(side="left", fill="x", expand=True)
+        # Pre-select last used if available
+        if self.settings['dest_history']:
+            self.dest_combo.current(0)
+
         tk.Button(self.dest_frame, text="Browse...", command=self.select_dest).pack(side="right", padx=(5, 0))
 
         # Info Label
-        info_text = f"ℹ️ Ignores: System files (Thumbs.db), Hidden files (.*), and entries in '{IGNORE_FILENAME}'."
+        info_text = f"ℹ️ Ignores: System files, Hidden files (.*), and entries in '{IGNORE_FILENAME}'."
         tk.Label(root, text=info_text, fg="#555555", font=("Arial", 9)).pack(pady=(5, 5), anchor="w", padx=10)
 
         # Run Button
@@ -111,17 +129,61 @@ class FileReplacerApp:
         self.user_choice_event = threading.Event()
         self.user_choice_path = None
 
+    def load_settings(self):
+        """Loads JSON settings or returns defaults."""
+        defaults = {'src_history': [], 'dest_history': []}
+        script_dir = Path(__file__).parent
+        settings_path = script_dir / SETTINGS_FILENAME
+        
+        if settings_path.exists():
+            try:
+                with open(settings_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception:
+                return defaults
+        return defaults
+
+    def save_settings(self):
+        """Saves current settings to JSON."""
+        script_dir = Path(__file__).parent
+        settings_path = script_dir / SETTINGS_FILENAME
+        try:
+            with open(settings_path, 'w', encoding='utf-8') as f:
+                json.dump(self.settings, f, indent=2)
+        except Exception as e:
+            self.log(f"Warning: Could not save settings: {e}")
+
+    def update_history(self, src_val, dest_val):
+        """Updates internal history lists and UI Comboboxes."""
+        
+        def _update_list(lst, value):
+            if not value: return lst
+            # Remove existing duplicate to move it to top
+            if value in lst:
+                lst.remove(value)
+            lst.insert(0, value)
+            return lst[:MAX_HISTORY]
+
+        # Update data
+        self.settings['src_history'] = _update_list(self.settings['src_history'], src_val)
+        self.settings['dest_history'] = _update_list(self.settings['dest_history'], dest_val)
+        
+        # Update UI
+        self.src_combo['values'] = self.settings['src_history']
+        self.dest_combo['values'] = self.settings['dest_history']
+        
+        # Save to file
+        self.save_settings()
+
     def select_source(self):
         path = filedialog.askdirectory()
         if path:
-            self.src_entry.delete(0, tk.END)
-            self.src_entry.insert(0, path)
+            self.src_combo.set(path) # Set text in Combobox
 
     def select_dest(self):
         path = filedialog.askdirectory()
         if path:
-            self.dest_entry.delete(0, tk.END)
-            self.dest_entry.insert(0, path)
+            self.dest_combo.set(path) # Set text in Combobox
 
     def log(self, message):
         self.root.after(0, self._log_internal, message)
@@ -133,7 +195,6 @@ class FileReplacerApp:
         self.log_area.config(state='disabled')
 
     def load_ignore_list(self):
-        """Loads names to ignore from the text file."""
         ignore_set = set()
         script_dir = Path(__file__).parent
         ignore_file_path = script_dir / IGNORE_FILENAME
@@ -150,23 +211,25 @@ class FileReplacerApp:
                 self.log(f"Error reading {IGNORE_FILENAME}: {e}")
         else:
             self.log(f"No '{IGNORE_FILENAME}' found (scanning all folders).")
-            
         return ignore_set
 
     def is_ignored(self, name, user_ignore_set):
-        """Checks if a file/folder name should be skipped."""
         if name in SYSTEM_JUNK: return True
         if name.startswith('.'): return True
         if name in user_ignore_set: return True
         return False
 
     def start_process(self):
-        src = self.src_entry.get()
-        dest = self.dest_entry.get()
+        # Get values from Comboboxes
+        src = self.src_combo.get().strip()
+        dest = self.dest_combo.get().strip()
 
         if not src or not dest:
             messagebox.showwarning("Error", "Please select both directories.")
             return
+        
+        # Update and save history BEFORE starting thread
+        self.update_history(src, dest)
 
         self.btn_run.config(state='disabled')
         self.log_area.config(state='normal')
@@ -199,26 +262,20 @@ class FileReplacerApp:
         try:
             dest_files_map = defaultdict(list)
             
-            # --- Step 1: Index Target Directory ---
             for root, dirs, files in os.walk(destination):
-                # Filter directories in-place (os.walk feature)
                 dirs[:] = [d for d in dirs if not self.is_ignored(d, ignored_names)]
-                
                 for filename in files:
                     if self.is_ignored(filename, ignored_names):
                         continue
-                        
                     full_path = Path(root) / filename
                     dest_files_map[filename].append(full_path)
             
             replaced_count = 0
             
-            # --- Step 2: Scan Source and Replace ---
             self.log("Scanning source...")
             for src_file in source.iterdir():
                 if src_file.is_file():
                     filename = src_file.name
-                    
                     if self.is_ignored(filename, ignored_names):
                         continue
 
